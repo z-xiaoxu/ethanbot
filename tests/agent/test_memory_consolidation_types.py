@@ -103,7 +103,10 @@ class TestMemoryConsolidationTypeHandling:
         assert parsed["summary"] == "User discussed testing."
 
         memory_content = store.memory_file.read_text()
-        parsed_mem = json.loads(memory_content)
+        # _ensure_structural_sections appends markdown after the JSON blob;
+        # extract just the first JSON object for this assertion.
+        json_end = memory_content.index("\n\n")
+        parsed_mem = json.loads(memory_content[:json_end])
         assert "User likes testing" in parsed_mem["facts"]
 
     @pytest.mark.asyncio

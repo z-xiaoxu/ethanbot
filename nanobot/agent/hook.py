@@ -45,5 +45,8 @@ class AgentHook:
     async def after_iteration(self, context: AgentHookContext) -> None:
         pass
 
+    async def on_retry(self, attempt: int, max_attempts: int, reason: str) -> None:
+        pass
+
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
         return content

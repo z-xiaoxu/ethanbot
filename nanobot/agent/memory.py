@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import weakref
 from datetime import datetime
 from pathlib import Path
@@ -72,8 +73,79 @@ def _is_tool_choice_unsupported(content: str | None) -> bool:
     return any(m in text for m in _TOOL_CHOICE_ERROR_MARKERS)
 
 
+_BO_HEADING = "## Behavioral Observations"
+_TOPIC_META_RE = re.compile(r"<!--\s*nanobot-topic-meta:.*?-->")
+_PROFILE_META_RE = re.compile(r"<!--\s*nanobot-profile-meta:.*?-->")
+_DEFAULT_TOPIC_META = "<!-- nanobot-topic-meta: last_synth_iso=1970-01-01T00:00:00Z -->"
+_DEFAULT_PROFILE_META = (
+    "<!-- nanobot-profile-meta: last_synth_iso=1970-01-01T00:00:00Z pending_count=0 -->"
+)
+_DEFAULT_BO_SECTION = """\
+## Behavioral Observations
+
+> **For the memory consolidation agent (memory_update)**: When consolidating long-term memory, \
+the full content of this file is included in the merge prompt. You must **preserve this section's \
+structure and headings**. When adding a new observable fact, append a short observation to the \
+`### Pending` list using the format shown below. Do not delete entries under `### Synthesized` \
+unless the user explicitly requests cleanup.
+>
+> **`### Pending` limit**: Maximum **10** `- ` list items. When full, apply \
+**rotation/compression** before adding new entries: (1) merge semantically duplicate or \
+similar-strength entries into one; (2) drop the weakest, oldest, or already-superseded \
+observations; (3) if still over limit, remove the oldest entry by FIFO and note the compression \
+in the merge summary.
+
+### Pending
+
+### Synthesized
+
+*This file is automatically updated by nanobot when important information should be remembered.*
+"""
+
+
+def _ensure_structural_sections(update: str, current: str) -> str:
+    """Guarantee that Behavioral Observations and meta comments survive consolidation.
+
+    If the LLM dropped these sections, restore them from *current* memory or fall back
+    to built-in defaults so that Heartbeat Profile/Topic Synthesis can always run.
+    """
+    # --- Behavioral Observations ---
+    if _BO_HEADING in current:
+        bo_idx = current.index(_BO_HEADING)
+        current_bo = current[bo_idx:]
+    else:
+        current_bo = None
+
+    if _BO_HEADING not in update:
+        preserved = current_bo or (_DEFAULT_BO_SECTION + "\n" + _DEFAULT_PROFILE_META)
+        update = update.rstrip() + "\n\n" + preserved
+    elif current_bo:
+        # LLM kept the heading but may have mangled the body — replace with original
+        update_bo_idx = update.index(_BO_HEADING)
+        update = update[:update_bo_idx].rstrip() + "\n\n" + current_bo
+
+    # --- topic meta ---
+    if not _TOPIC_META_RE.search(update):
+        current_match = _TOPIC_META_RE.search(current)
+        meta = current_match.group(0) if current_match else _DEFAULT_TOPIC_META
+        # Insert just before Behavioral Observations
+        if _BO_HEADING in update:
+            bo_pos = update.index(_BO_HEADING)
+            update = update[:bo_pos].rstrip() + "\n\n" + meta + "\n\n" + update[bo_pos:]
+        else:
+            update = update.rstrip() + "\n\n" + meta
+
+    # --- profile meta ---
+    if not _PROFILE_META_RE.search(update):
+        current_match = _PROFILE_META_RE.search(current)
+        meta = current_match.group(0) if current_match else _DEFAULT_PROFILE_META
+        update = update.rstrip() + "\n" + meta + "\n"
+
+    return update
+
+
 class MemoryStore:
-    """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
+    """Three-tier memory: Core (MEMORY.md), Topic (memory/topics/*.md), Event Log (HISTORY.md)."""
 
     _MAX_FAILURES_BEFORE_RAW_ARCHIVE = 3
 
@@ -81,6 +153,7 @@ class MemoryStore:
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
+        self.topics_dir = self.memory_dir / "topics"
         self._consecutive_failures = 0
 
     def read_long_term(self) -> str:
@@ -95,9 +168,45 @@ class MemoryStore:
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(entry.rstrip() + "\n\n")
 
+    def list_topics(self) -> list[dict[str, str]]:
+        """List topic file stems and short summaries (first 5 non-heading body lines)."""
+        if not self.topics_dir.exists():
+            return []
+        result: list[dict[str, str]] = []
+        for f in sorted(self.topics_dir.glob("*.md")):
+            text = f.read_text(encoding="utf-8")
+            lines = [
+                l.strip("- ").strip()
+                for l in text.splitlines()
+                if l.strip() and not l.startswith("#")
+            ]
+            summary = "; ".join(lines[:5])
+            result.append({"name": f.stem, "summary": summary})
+        return result
+
+    def read_topic(self, name: str) -> str:
+        path = self.topics_dir / f"{name}.md"
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def write_topic(self, name: str, content: str) -> None:
+        ensure_dir(self.topics_dir)
+        (self.topics_dir / f"{name}.md").write_text(content, encoding="utf-8")
+
     def get_memory_context(self) -> str:
+        parts: list[str] = []
         long_term = self.read_long_term()
-        return f"## Long-term Memory\n{long_term}" if long_term else ""
+        if long_term:
+            parts.append(f"## Core Memory\n{long_term}")
+
+        topics = self.list_topics()
+        if topics:
+            index_lines = [f"- **{t['name']}**: {t['summary']}" for t in topics]
+            parts.append(
+                "## Topic Memory Index\n"
+                + "\n".join(index_lines)
+                + "\n\nUse read_file on memory/topics/<name>.md for full details."
+            )
+        return "\n\n".join(parts)
 
     @staticmethod
     def _format_messages(messages: list[dict]) -> str:
@@ -122,16 +231,43 @@ class MemoryStore:
             return True
 
         current_memory = self.read_long_term()
+        topics = self.list_topics()
+        topic_hint = ""
+        if topics:
+            hint_lines = [f"- {t['name']}: {t['summary']}" for t in topics]
+            topic_hint = (
+                "\n\n## Existing Topic Memories\n"
+                + "\n".join(hint_lines)
+                + "\n\nDo not duplicate topic-specific details already covered above."
+            )
+
         prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
 
 ## Current Long-term Memory
-{current_memory or "(empty)"}
+{current_memory or "(empty)"}{topic_hint}
 
 ## Conversation to Process
 {self._format_messages(messages)}"""
 
+        system_parts = [
+            "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation.",
+            "Organize MEMORY.md with clear project or theme sections where appropriate.",
+            "Keep user-level facts (identity, preferences, relationships) separate from project-specific technical details.",
+            "Use descriptive headings so recurring themes can be identified later.",
+            "CRITICAL: You MUST preserve these structural elements EXACTLY as they appear in the current memory:",
+            "1. The `## Behavioral Observations` section and everything below it"
+            " (including `### Pending`, `### Synthesized`, blockquotes, and all HTML comments)"
+            " must be kept at the END of the file, unchanged.",
+            "2. All HTML comments (`<!-- ... -->`) must be preserved verbatim — they contain"
+            " metadata used by other subsystems.",
+            "3. Only update content ABOVE `## Behavioral Observations`."
+            " If that section does not exist in the current memory, do NOT create it"
+            " — the system will add it automatically.",
+        ]
+        system_content = "\n".join(system_parts)
+
         chat_messages = [
-            {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": prompt},
         ]
 
@@ -188,6 +324,7 @@ class MemoryStore:
 
             self.append_history(entry)
             update = _ensure_text(update)
+            update = _ensure_structural_sections(update, current_memory)
             if update != current_memory:
                 self.write_long_term(update)
 

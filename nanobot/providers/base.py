@@ -92,6 +92,12 @@ class LLMProvider(ABC):
         "connection",
         "server error",
         "temporarily unavailable",
+        "负载",
+        "请稍后重试",
+        "服务繁忙",
+        "请求过多",
+        "限流",
+        "稍后再试",
     )
 
     _SENTINEL = object()
@@ -273,6 +279,7 @@ class LLMProvider(ABC):
         reasoning_effort: object = _SENTINEL,
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_retry: Callable[[int, int, str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """Call chat_stream() with retry on transient provider failures."""
         if max_tokens is self._SENTINEL:
@@ -289,6 +296,7 @@ class LLMProvider(ABC):
             on_content_delta=on_content_delta,
         )
 
+        max_attempts = len(self._CHAT_RETRY_DELAYS) + 1
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
             response = await self._safe_chat_stream(**kw)
 
@@ -302,6 +310,8 @@ class LLMProvider(ABC):
                     return await self._safe_chat_stream(**{**kw, "messages": stripped})
                 return response
 
+            if on_retry:
+                await on_retry(attempt, max_attempts, response.content or "")
             logger.warning(
                 "LLM transient error (attempt {}/{}), retrying in {}s: {}",
                 attempt, len(self._CHAT_RETRY_DELAYS), delay,
@@ -320,6 +330,7 @@ class LLMProvider(ABC):
         temperature: object = _SENTINEL,
         reasoning_effort: object = _SENTINEL,
         tool_choice: str | dict[str, Any] | None = None,
+        on_retry: Callable[[int, int, str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """Call chat() with retry on transient provider failures.
 
@@ -340,6 +351,7 @@ class LLMProvider(ABC):
             reasoning_effort=reasoning_effort, tool_choice=tool_choice,
         )
 
+        max_attempts = len(self._CHAT_RETRY_DELAYS) + 1
         for attempt, delay in enumerate(self._CHAT_RETRY_DELAYS, start=1):
             response = await self._safe_chat(**kw)
 
@@ -353,6 +365,8 @@ class LLMProvider(ABC):
                     return await self._safe_chat(**{**kw, "messages": stripped})
                 return response
 
+            if on_retry:
+                await on_retry(attempt, max_attempts, response.content or "")
             logger.warning(
                 "LLM transient error (attempt {}/{}), retrying in {}s: {}",
                 attempt, len(self._CHAT_RETRY_DELAYS), delay,

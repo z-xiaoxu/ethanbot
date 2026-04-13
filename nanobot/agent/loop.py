@@ -51,6 +51,75 @@ class AgentLoop:
 
     _TOOL_RESULT_MAX_CHARS = 16_000
 
+    _ERROR_CLASSIFICATIONS: list[tuple[tuple[str, ...], str]] = [
+        (
+            ("401", "unauthorized", "authentication", "invalid_api_key", "api key", "api_key",
+             "认证失败", "密钥无效", "鉴权失败"),
+            "The API key is invalid or expired. Please check your provider configuration.",
+        ),
+        (
+            ("403", "forbidden", "permission", "权限不足", "无权访问"),
+            "Access denied by the AI provider. Please verify your API permissions.",
+        ),
+        (
+            ("429", "rate limit", "rate_limit", "too many requests", "quota exceeded",
+             "请求过多", "限流", "频率限制"),
+            "The AI provider rate limit has been reached. Please try again shortly.",
+        ),
+        (
+            ("insufficient", "billing", "payment", "余额不足", "欠费", "配额"),
+            "The AI provider account has insufficient balance or quota. "
+            "Please check your account.",
+        ),
+        (
+            ("context length", "context_length", "maximum context length",
+             "max tokens", "token limit", "上下文长度", "超出长度限制"),
+            "The conversation is too long for the model to process. "
+            "Please start a new conversation with /new.",
+        ),
+        (
+            ("model not found", "model_not_found", "does not exist",
+             "invalid model", "model not available", "模型不存在", "模型不可用"),
+            "The configured model is not available. Please check your model settings.",
+        ),
+        (
+            ("timeout", "timed out", "deadline", "超时", "响应超时"),
+            "The AI model response timed out. Please try again.",
+        ),
+        (
+            ("overloaded", "503", "502", "500", "server error",
+             "temporarily unavailable", "504",
+             "负载", "服务繁忙", "请稍后重试", "稍后再试", "服务不可用", "服务异常"),
+            "The AI service is temporarily unavailable. Please try again in a moment.",
+        ),
+        (
+            ("connection", "network", "dns", "resolve", "网络", "连接失败"),
+            "Unable to connect to the AI provider. Please check your network connection.",
+        ),
+        (
+            ("content filter", "content_filter", "safety", "blocked", "moderation",
+             "内容审核", "内容过滤", "违规"),
+            "The request was blocked by the AI provider's content filter. "
+            "Please rephrase your message.",
+        ),
+    ]
+
+    _DEFAULT_CLASSIFIED_ERROR = (
+        "Sorry, an error occurred while calling the AI model. Please try again later."
+    )
+
+    @staticmethod
+    def _classify_error(raw: str | None) -> str:
+        """Map a raw LLM/provider error string to a user-friendly message."""
+        if not raw:
+            return AgentLoop._DEFAULT_CLASSIFIED_ERROR
+        lower = raw.lower()
+        for markers, message in AgentLoop._ERROR_CLASSIFICATIONS:
+            if any(m in lower for m in markers):
+                return message
+        snippet = raw[:100].rstrip()
+        return f"{AgentLoop._DEFAULT_CLASSIFIED_ERROR} (Error: {snippet})"
+
     def __init__(
         self,
         bus: MessageBus,
@@ -254,6 +323,13 @@ class AgentLoop:
                     logger.info("Tool call: {}({})", tc.name, args_str[:200])
                 loop_self._set_tool_context(channel, chat_id, message_id)
 
+            async def on_retry(self, attempt: int, max_attempts: int, reason: str) -> None:
+                if on_progress:
+                    await on_progress(
+                        f"AI model is temporarily unavailable, retrying... "
+                        f"(attempt {attempt}/{max_attempts})"
+                    )
+
             def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
                 return loop_self._strip_think(content)
 
@@ -267,11 +343,13 @@ class AgentLoop:
             concurrent_tools=True,
         ))
         self._last_usage = result.usage
+        final_content = result.final_content
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
         elif result.stop_reason == "error":
-            logger.error("LLM returned error: {}", (result.final_content or "")[:200])
-        return result.final_content, result.tools_used, result.messages
+            logger.error("LLM returned error: {}", (final_content or "")[:200])
+            final_content = self._classify_error(final_content)
+        return final_content, result.tools_used, result.messages
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -299,6 +377,8 @@ class AgentLoop:
                 ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=self)
                 result = await self.commands.dispatch_priority(ctx)
                 if result:
+                    for k, v in (msg.metadata or {}).items():
+                        result.metadata.setdefault(k, v)
                     await self.bus.publish_outbound(result)
                 continue
             task = asyncio.create_task(self._dispatch(msg))
@@ -312,8 +392,8 @@ class AgentLoop:
         async with lock, gate:
             try:
                 on_stream = on_stream_end = None
+                has_streamed = False
                 if msg.metadata.get("_wants_stream"):
-                    # Split one answer into distinct stream segments.
                     stream_base_id = f"{msg.session_key}:{time.time_ns()}"
                     stream_segment = 0
 
@@ -321,6 +401,8 @@ class AgentLoop:
                         return f"{stream_base_id}:{stream_segment}"
 
                     async def on_stream(delta: str) -> None:
+                        nonlocal has_streamed
+                        has_streamed = True
                         await self.bus.publish_outbound(OutboundMessage(
                             channel=msg.channel, chat_id=msg.chat_id,
                             content=delta,
@@ -347,6 +429,10 @@ class AgentLoop:
                     msg, on_stream=on_stream, on_stream_end=on_stream_end,
                 )
                 if response is not None:
+                    if not has_streamed:
+                        response.metadata.pop("_streamed", None)
+                    for k, v in (msg.metadata or {}).items():
+                        response.metadata.setdefault(k, v)
                     await self.bus.publish_outbound(response)
                 elif msg.channel == "cli":
                     await self.bus.publish_outbound(OutboundMessage(
@@ -356,11 +442,13 @@ class AgentLoop:
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
-            except Exception:
+            except Exception as exc:
                 logger.exception("Error processing message for session {}", msg.session_key)
+                error_meta = dict(msg.metadata or {})
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
-                    content="Sorry, I encountered an error.",
+                    content=self._classify_error(str(exc)),
+                    metadata=error_meta,
                 ))
 
     async def close_mcp(self) -> None:

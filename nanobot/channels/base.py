@@ -91,6 +91,14 @@ class BaseChannel(ABC):
         """
         pass
 
+    async def on_response_complete(self, msg: OutboundMessage) -> None:
+        """Called when a streamed response is fully delivered.
+
+        Override in subclasses that need post-response housekeeping (e.g.
+        updating reactions).  The *msg* carries the same metadata as the
+        original inbound message so channels can correlate it.
+        """
+
     async def send_delta(self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
         """Deliver a streaming text chunk.
 

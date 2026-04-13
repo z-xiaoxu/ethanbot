@@ -82,7 +82,8 @@ You are nanobot, a helpful AI assistant.
 
 ## Workspace
 Your workspace is at: {workspace_path}
-- Long-term memory: {workspace_path}/memory/MEMORY.md (write important facts here)
+- Core memory: {workspace_path}/memory/MEMORY.md (identity, preferences, relationships, behavioral notes)
+- Topic memory: {workspace_path}/memory/topics/{{name}}.md (project or theme details; index is always in context; use read_file for full text)
 - History log: {workspace_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
@@ -122,6 +123,37 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
 
         return "\n\n".join(parts) if parts else ""
 
+    @staticmethod
+    def _extract_topic_keywords(name: str, _summary: str) -> list[str]:
+        """Derive case-insensitive substring keywords from a topic stem (spec algorithm)."""
+        stripped = name.replace("project-", "")
+        parts = stripped.split("-")
+        keywords = [p.lower() for p in parts if len(p) > 2]
+        if "-" in stripped:
+            keywords.append(stripped.lower())
+        return keywords
+
+    def _match_and_load_topics(self, current_message: str, history: list[dict[str, Any]]) -> str:
+        """Load full topic bodies when name-derived keywords appear in recent user-visible text."""
+        topics = self.memory.list_topics()
+        if not topics:
+            return ""
+        recent_text = current_message
+        for msg in history[-6:]:
+            content = msg.get("content")
+            if isinstance(content, str):
+                recent_text += " " + content
+        recent_lower = recent_text.lower()
+
+        loaded: list[str] = []
+        for t in topics:
+            keywords = self._extract_topic_keywords(t["name"], t.get("summary", ""))
+            if any(kw in recent_lower for kw in keywords):
+                content = self.memory.read_topic(t["name"])
+                if content:
+                    loaded.append(f"## {t['name']}\n{content}")
+        return "\n\n".join(loaded)
+
     def build_messages(
         self,
         history: list[dict[str, Any]],
@@ -143,8 +175,13 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
+        system_prompt = self.build_system_prompt(skill_names)
+        topic_context = self._match_and_load_topics(current_message, history)
+        if topic_context:
+            system_prompt += f"\n\n---\n\n# Active Topic Context\n\n{topic_context}"
+
         return [
-            {"role": "system", "content": self.build_system_prompt(skill_names)},
+            {"role": "system", "content": system_prompt},
             *history,
             {"role": current_role, "content": merged},
         ]

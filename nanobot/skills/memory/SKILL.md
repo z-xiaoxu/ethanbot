@@ -1,15 +1,28 @@
 ---
 name: memory
-description: Two-layer memory system with grep-based recall.
+description: Three-tier memory (Core, Topic, Event Log) with grep-based recall.
 always: true
 ---
 
 # Memory
 
-## Structure
+## Structure (three tiers)
 
-- `memory/MEMORY.md` — Long-term facts (preferences, project context, relationships). Always loaded into your context.
-- `memory/HISTORY.md` — Append-only event log. NOT loaded into context. Search it with grep-style tools or in-memory filters. Each entry starts with [YYYY-MM-DD HH:MM].
+- **Core** — `memory/MEMORY.md`. Always loaded. Holds identity, preferences, key relationships, and behavioral notes. Not a fixed template except for `## Behavioral Observations`.
+- **Topic** — `memory/topics/<name>.md`. A **Topic Memory Index** (names + short summaries) is always in context; full files load when keywords match recent messages or when you `read_file` them. Use for project context, deep dives, and ongoing themes.
+- **Event Log** — `memory/HISTORY.md`. Append-only timeline. **Not** loaded into context. Search with grep-style tools or targeted reads.
+
+## Behavioral Observations
+
+`## Behavioral Observations` contains `### Pending` / `### Synthesized`. The memory consolidation agent must **preserve this structure**. New observations go to `### Pending` as `- [USER][thread:...]` or `- [SOUL][thread:...]` (max 10 items; see that section for rotation). See `memory/MEMORY.md` and `HEARTBEAT.md` for **Profile Synthesis** and **Topic Synthesis**.
+
+## Using Topic Memory
+
+Before answering non-trivial questions, check the Topic Memory Index in context:
+
+1. If the conversation likely relates to any listed topic, **`read_file`** that topic **first**.
+2. When unsure which topic applies, **`read_file`** the most likely candidate.
+3. If several topics could apply, load **all** of them.
 
 ## Search Past Events
 
@@ -28,10 +41,11 @@ Prefer targeted command-line search for large history files.
 ## When to Update MEMORY.md
 
 Write important facts immediately using `edit_file` or `write_file`:
+
 - User preferences ("I prefer dark mode")
-- Project context ("The API uses OAuth2")
-- Relationships ("Alice is the project lead")
+- Cross-cutting relationships ("Alice is the project lead")
+- Notes that belong in Core rather than a single project file
 
 ## Auto-consolidation
 
-Old conversations are automatically summarized and appended to HISTORY.md when the session grows large. Long-term facts are extracted to MEMORY.md. You don't need to manage this.
+Old conversations are automatically summarized and appended to `HISTORY.md` when the session grows large. Long-term facts are extracted into `MEMORY.md`. Topic Synthesis (Heartbeat) can later move bulky project narrative into `memory/topics/`. You do not need to manage consolidation yourself.

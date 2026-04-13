@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import tiktoken
+from loguru import logger
 
 
 def strip_think(text: str) -> str:
@@ -269,8 +270,83 @@ def build_status_content(
     ])
 
 
+def _migrate_heartbeat_sections(path: Path) -> bool:
+    """Migrate old-format HEARTBEAT.md to System Tasks / Active Tasks layout.
+
+    Detects the old format (has ``## Active Tasks`` but no ``## System Tasks``),
+    identifies known default tasks by heading keywords, and moves them into a new
+    ``## System Tasks`` section.  Returns True if the file was rewritten.
+    """
+    import re
+
+    text = path.read_text(encoding="utf-8")
+    if "## System Tasks" in text or "## Active Tasks" not in text:
+        return False
+
+    _KNOWN_SYSTEM_HEADINGS = {"Profile Synthesis", "Topic Synthesis"}
+
+    active_match = re.search(
+        r"^(## Active Tasks\s*\n)(.*?)(?=\n## |\Z)",
+        text,
+        re.DOTALL | re.MULTILINE,
+    )
+    if not active_match:
+        return False
+
+    body = active_match.group(2)
+    sections: list[dict] = []
+    current: dict | None = None
+    for line in body.splitlines(keepends=True):
+        if line.strip().startswith("### "):
+            if current:
+                sections.append(current)
+            current = {"heading": line.strip().lstrip("# ").strip(), "lines": [line]}
+        elif current:
+            current["lines"].append(line)
+        else:
+            sections.append({"heading": "", "lines": [line]})
+
+    if current:
+        sections.append(current)
+
+    system_parts: list[str] = []
+    user_parts: list[str] = []
+    for sec in sections:
+        is_system = any(kw in sec["heading"] for kw in _KNOWN_SYSTEM_HEADINGS)
+        (system_parts if is_system else user_parts).append("".join(sec["lines"]))
+
+    system_body = "".join(system_parts).strip()
+    user_body = "".join(user_parts).strip()
+
+    before = text[: active_match.start()]
+    after = text[active_match.end() :]
+
+    new_section = "## System Tasks\n\n"
+    new_section += (
+        "<!-- Built-in background tasks. Results are silently processed"
+        " — no user notification. -->\n\n"
+    )
+    if system_body:
+        new_section += system_body + "\n\n"
+    new_section += "## Active Tasks\n\n"
+    new_section += (
+        "<!-- Add your periodic tasks below this line."
+        " You will be notified of results. -->\n\n"
+    )
+    if user_body:
+        new_section += user_body + "\n"
+
+    path.write_text(before + new_section + after, encoding="utf-8")
+    logger.info("Migrated HEARTBEAT.md to System Tasks / Active Tasks layout")
+    return True
+
+
 def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
-    """Sync bundled templates to workspace. Only creates missing files."""
+    """Sync bundled templates to workspace. Only creates missing files.
+
+    Also migrates existing HEARTBEAT.md from old single-section format to
+    the ``System Tasks`` / ``Active Tasks`` layout when detected.
+    """
     from importlib.resources import files as pkg_files
     try:
         tpl = pkg_files("nanobot") / "templates"
@@ -294,6 +370,10 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
     _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md")
     _write(None, workspace / "memory" / "HISTORY.md")
     (workspace / "skills").mkdir(exist_ok=True)
+
+    heartbeat_path = workspace / "HEARTBEAT.md"
+    if heartbeat_path.exists():
+        _migrate_heartbeat_sections(heartbeat_path)
 
     if added and not silent:
         from rich.console import Console

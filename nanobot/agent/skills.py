@@ -2,9 +2,13 @@
 
 import json
 import os
+import platform
 import re
 import shutil
+import subprocess
 from pathlib import Path
+
+from loguru import logger
 
 # Default builtin skills directory (relative to this file)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
@@ -138,6 +142,74 @@ class SkillsLoader:
         lines.append("</skills>")
 
         return "\n".join(lines)
+
+    def install_missing_deps(self) -> list[dict[str, str]]:
+        """Try to install missing CLI dependencies for all skills.
+
+        Picks the best installer for the current platform from each skill's
+        ``install`` metadata.  Failures are logged but never raised.
+
+        Returns a list of ``{"skill", "label", "status"}`` dicts for reporting.
+        """
+        results: list[dict[str, str]] = []
+        sys_platform = platform.system().lower()  # "darwin" / "linux"
+
+        for skill in self.list_skills(filter_unavailable=False):
+            meta = self._get_skill_meta(skill["name"])
+            if self._check_requirements(meta):
+                continue
+
+            install_entries: list[dict] = meta.get("install", [])
+            if not install_entries:
+                continue
+
+            entry = self._pick_installer(install_entries, sys_platform)
+            if not entry:
+                continue
+
+            already_have = all(shutil.which(b) for b in entry.get("bins", []))
+            if already_have:
+                continue
+
+            label = entry.get("label", skill["name"])
+            cmd = self._build_install_cmd(entry)
+            if not cmd:
+                continue
+
+            try:
+                logger.info("Installing skill dep: {}", label)
+                subprocess.run(
+                    cmd, check=True, capture_output=True, timeout=120,
+                )
+                results.append({"skill": skill["name"], "label": label, "status": "ok"})
+            except Exception as exc:
+                logger.warning("Failed to install {}: {}", label, exc)
+                results.append({"skill": skill["name"], "label": label, "status": str(exc)})
+
+        return results
+
+    @staticmethod
+    def _pick_installer(entries: list[dict], sys_platform: str) -> dict | None:
+        preferred = "brew" if sys_platform == "darwin" else "apt"
+        fallback = "apt" if preferred == "brew" else "brew"
+        by_kind = {e.get("kind"): e for e in entries}
+
+        for kind in (preferred, fallback):
+            entry = by_kind.get(kind)
+            if entry and shutil.which(kind):
+                return entry
+        return None
+
+    @staticmethod
+    def _build_install_cmd(entry: dict) -> list[str] | None:
+        kind = entry.get("kind")
+        if kind == "brew":
+            formula = entry.get("formula")
+            return ["brew", "install", formula] if formula else None
+        if kind == "apt":
+            package = entry.get("package")
+            return ["sudo", "apt-get", "install", "-y", package] if package else None
+        return None
 
     def _get_missing_requirements(self, skill_meta: dict) -> str:
         """Get a description of missing requirements."""

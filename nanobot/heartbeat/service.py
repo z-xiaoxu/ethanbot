@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
@@ -142,6 +143,25 @@ class HeartbeatService:
             except Exception as e:
                 logger.error("Heartbeat error: {}", e)
 
+    @staticmethod
+    def _has_user_tasks(content: str) -> bool:
+        """Check if HEARTBEAT.md has user-defined tasks under ``## Active Tasks``."""
+        match = re.search(
+            r"^## Active Tasks\s*\n(.*?)(?=\n## |\Z)",
+            content,
+            re.DOTALL | re.MULTILINE,
+        )
+        if not match:
+            return False
+        section = match.group(1)
+        for line in section.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("<!--"):
+                continue
+            if stripped.startswith("###") or stripped.startswith("- "):
+                return True
+        return False
+
     async def _tick(self) -> None:
         """Execute a single heartbeat tick."""
         from nanobot.utils.evaluator import evaluate_response
@@ -164,7 +184,8 @@ class HeartbeatService:
             if self.on_execute:
                 response = await self.on_execute(tasks)
 
-                if response:
+                has_user_tasks = self._has_user_tasks(content)
+                if response and has_user_tasks:
                     should_notify = await evaluate_response(
                         response, tasks, self.provider, self.model,
                     )
@@ -173,6 +194,8 @@ class HeartbeatService:
                         await self.on_notify(response)
                     else:
                         logger.info("Heartbeat: silenced by post-run evaluation")
+                elif not has_user_tasks:
+                    logger.info("Heartbeat: system-only tasks, notification suppressed")
         except Exception:
             logger.exception("Heartbeat execution failed")
 

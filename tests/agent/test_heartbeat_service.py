@@ -22,6 +22,32 @@ class DummyProvider(LLMProvider):
         return "test-model"
 
 
+class TestHasUserTasks:
+    def test_active_tasks_with_heading(self):
+        content = "## System Tasks\n### sys\n\n## Active Tasks\n\n### My task\n- do stuff\n"
+        assert HeartbeatService._has_user_tasks(content) is True
+
+    def test_active_tasks_with_list_item(self):
+        content = "## Active Tasks\n\n- my custom task\n"
+        assert HeartbeatService._has_user_tasks(content) is True
+
+    def test_active_tasks_empty(self):
+        content = (
+            "## System Tasks\n### sys\n\n"
+            "## Active Tasks\n\n<!-- no tasks -->\n\n"
+            "## Completed\n"
+        )
+        assert HeartbeatService._has_user_tasks(content) is False
+
+    def test_no_active_tasks_section(self):
+        content = "## System Tasks\n### sys task\n"
+        assert HeartbeatService._has_user_tasks(content) is False
+
+    def test_old_format_no_section(self):
+        content = "- [ ] some task\n"
+        assert HeartbeatService._has_user_tasks(content) is False
+
+
 @pytest.mark.asyncio
 async def test_start_is_idempotent(tmp_path) -> None:
     provider = DummyProvider([])
@@ -126,7 +152,10 @@ async def test_trigger_now_returns_none_when_decision_is_skip(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_tick_notifies_when_evaluator_says_yes(tmp_path, monkeypatch) -> None:
     """Phase 1 run -> Phase 2 execute -> Phase 3 evaluate=notify -> on_notify called."""
-    (tmp_path / "HEARTBEAT.md").write_text("- [ ] check deployments", encoding="utf-8")
+    (tmp_path / "HEARTBEAT.md").write_text(
+        "## Active Tasks\n\n### Check deployments\n- [ ] check deployments\n",
+        encoding="utf-8",
+    )
 
     provider = DummyProvider([
         LLMResponse(
@@ -172,7 +201,10 @@ async def test_tick_notifies_when_evaluator_says_yes(tmp_path, monkeypatch) -> N
 @pytest.mark.asyncio
 async def test_tick_suppresses_when_evaluator_says_no(tmp_path, monkeypatch) -> None:
     """Phase 1 run -> Phase 2 execute -> Phase 3 evaluate=silent -> on_notify NOT called."""
-    (tmp_path / "HEARTBEAT.md").write_text("- [ ] check status", encoding="utf-8")
+    (tmp_path / "HEARTBEAT.md").write_text(
+        "## Active Tasks\n\n### Check status\n- [ ] check status\n",
+        encoding="utf-8",
+    )
 
     provider = DummyProvider([
         LLMResponse(
@@ -213,6 +245,62 @@ async def test_tick_suppresses_when_evaluator_says_no(tmp_path, monkeypatch) -> 
     await service._tick()
     assert executed == ["check status"]
     assert notified == []
+
+
+@pytest.mark.asyncio
+async def test_tick_suppresses_system_only_tasks(tmp_path, monkeypatch) -> None:
+    """System-only tasks execute but never notify, regardless of evaluator."""
+    (tmp_path / "HEARTBEAT.md").write_text(
+        "## System Tasks\n\n### Profile Synthesis\n- synthesis task\n\n"
+        "## Active Tasks\n\n<!-- no user tasks -->\n",
+        encoding="utf-8",
+    )
+
+    provider = DummyProvider([
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCallRequest(
+                    id="hb_1",
+                    name="heartbeat",
+                    arguments={"action": "run", "tasks": "profile synthesis"},
+                )
+            ],
+        ),
+    ])
+
+    executed: list[str] = []
+    notified: list[str] = []
+
+    async def _on_execute(tasks: str) -> str:
+        executed.append(tasks)
+        return "synthesis completed"
+
+    async def _on_notify(response: str) -> None:
+        notified.append(response)
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=provider,
+        model="openai/gpt-4o-mini",
+        on_execute=_on_execute,
+        on_notify=_on_notify,
+    )
+
+    eval_called = []
+
+    async def _eval_should_not_be_called(*a, **kw):
+        eval_called.append(True)
+        return True
+
+    monkeypatch.setattr(
+        "nanobot.utils.evaluator.evaluate_response", _eval_should_not_be_called,
+    )
+
+    await service._tick()
+    assert executed == ["profile synthesis"]
+    assert notified == []
+    assert eval_called == [], "evaluate_response should not be called for system-only tasks"
 
 
 @pytest.mark.asyncio

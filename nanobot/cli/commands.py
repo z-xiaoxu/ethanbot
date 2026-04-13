@@ -319,6 +319,17 @@ def onboard(
 
     sync_workspace_templates(workspace_path)
 
+    # Auto-install missing CLI deps for built-in skills (best-effort).
+    from nanobot.agent.skills import SkillsLoader
+
+    loader = SkillsLoader(workspace_path)
+    results = loader.install_missing_deps()
+    for r in results:
+        if r["status"] == "ok":
+            console.print(f"[green]✓[/green] Installed skill dep: {r['label']}")
+        else:
+            console.print(f"[yellow]⚠[/yellow] Skill dep skipped: {r['label']} ({r['status']})")
+
     agent_cmd = 'nanobot agent -m "Hello!"'
     gateway_cmd = "nanobot gateway"
     if config:
@@ -674,8 +685,21 @@ def gateway(
 
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
 
+    async def _install_skill_deps():
+        """Best-effort install of missing skill CLI deps in a background thread."""
+        from nanobot.agent.skills import SkillsLoader
+
+        loader = SkillsLoader(config.workspace_path)
+        results = await asyncio.to_thread(loader.install_missing_deps)
+        for r in results:
+            if r["status"] == "ok":
+                console.print(f"[green]✓[/green] Installed skill dep: {r['label']}")
+            else:
+                console.print(f"[yellow]⚠[/yellow] Skill dep skipped: {r['label']} ({r['status']})")
+
     async def run():
         try:
+            asyncio.create_task(_install_skill_deps())
             await cron.start()
             await heartbeat.start()
             await asyncio.gather(

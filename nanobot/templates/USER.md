@@ -8,42 +8,40 @@ Information about the user to help personalize interactions.
 - **Timezone**: (your timezone, e.g., UTC+8)
 - **Language**: (preferred language)
 
-## Preferences
-
-### Communication Style
-
-- [ ] Casual
-- [ ] Professional
-- [ ] Technical
-
-### Response Length
-
-- [ ] Brief and concise
-- [ ] Detailed explanations
-- [ ] Adaptive based on question
-
-### Technical Level
-
-- [ ] Beginner
-- [ ] Intermediate
-- [ ] Expert
-
 ## Work Context
 
 - **Primary Role**: (your role, e.g., developer, researcher)
 - **Main Projects**: (what you're working on)
 - **Tools You Use**: (IDEs, languages, frameworks)
 
-## Topics of Interest
-
-- 
-- 
-- 
-
 ## Special Instructions
 
 (Any specific instructions for how the assistant should behave)
 
----
+## Dynamic Profile
 
-*Edit this file to customize nanobot's behavior for your needs.*
+> **Auto-boundary**: Only the Heartbeat "Profile Synthesis" task may **replace the entire block** from this heading `## Dynamic Profile` to the **next sibling `## ` heading** or end of file. Other agent steps must not modify sections outside this block (e.g., `## Basic Information`, `## Work Context`).
+
+### Communication Style
+
+- (populated after Profile Synthesis from `[USER]` observations in `memory/MEMORY.md`)
+
+### Response Preferences
+
+- 
+
+### Technical Tendencies
+
+- 
+
+### Decision Preferences
+
+- 
+
+### Focus Areas
+
+- 
+
+### Work Patterns
+
+- 
