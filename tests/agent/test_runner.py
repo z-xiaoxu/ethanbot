@@ -19,15 +19,15 @@ def _make_loop(tmp_path):
 
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
-         patch("nanobot.agent.loop.SubagentManager") as MockSubMgr:
-        MockSubMgr.return_value.cancel_by_session = AsyncMock(return_value=0)
+         patch("nanobot.agent.loop.SubagentManager") as mock_submgr:
+        mock_submgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path)
     return loop
 
 
 @pytest.mark.asyncio
 async def test_runner_preserves_reasoning_fields_and_tool_results():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     captured_second_call: list[dict] = []
@@ -65,7 +65,7 @@ async def test_runner_preserves_reasoning_fields_and_tool_results():
     assert result.final_content == "done"
     assert result.tools_used == ["list_dir"]
     assert result.tool_events == [
-        {"name": "list_dir", "status": "ok", "detail": "tool result"}
+        {"name": "list_dir", "status": "ok", "detail": "tool result", "tool_call_id": "call_1"},
     ]
 
     assistant_messages = [
@@ -84,7 +84,7 @@ async def test_runner_preserves_reasoning_fields_and_tool_results():
 @pytest.mark.asyncio
 async def test_runner_calls_hooks_in_order():
     from nanobot.agent.hook import AgentHook, AgentHookContext
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     call_count = {"n": 0}
@@ -147,7 +147,7 @@ async def test_runner_calls_hooks_in_order():
             0,
             None,
             ["tool result"],
-            [{"name": "list_dir", "status": "ok", "detail": "tool result"}],
+            [{"name": "list_dir", "status": "ok", "detail": "tool result", "tool_call_id": "call_1"}],
             None,
         ),
         ("before_iteration", 1),
@@ -159,7 +159,7 @@ async def test_runner_calls_hooks_in_order():
 @pytest.mark.asyncio
 async def test_runner_streaming_hook_receives_deltas_and_end_signal():
     from nanobot.agent.hook import AgentHook, AgentHookContext
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     streamed: list[str] = []
@@ -201,8 +201,46 @@ async def test_runner_streaming_hook_receives_deltas_and_end_signal():
 
 
 @pytest.mark.asyncio
+async def test_runner_tool_event_includes_path_for_read_file():
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(
+            content="",
+            tool_calls=[ToolCallRequest(
+                id="c1",
+                name="read_file",
+                arguments={"path": "skills/x/SKILL.md", "offset": 1},
+            )],
+            usage={},
+        ),
+        LLMResponse(content="done", tool_calls=[], usage={}),
+    ])
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = AsyncMock(return_value="line 1: hello")
+
+    runner = AgentRunner(provider)
+    result = await runner.run(AgentRunSpec(
+        initial_messages=[],
+        tools=tools,
+        model="test-model",
+        max_iterations=2,
+    ))
+
+    assert result.tool_events == [{
+        "name": "read_file",
+        "status": "ok",
+        "detail": "line 1: hello",
+        "path": "skills/x/SKILL.md",
+        "tool_call_id": "c1",
+    }]
+
+
+@pytest.mark.asyncio
 async def test_runner_returns_max_iterations_fallback():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
@@ -230,7 +268,7 @@ async def test_runner_returns_max_iterations_fallback():
 
 @pytest.mark.asyncio
 async def test_runner_returns_structured_tool_error():
-    from nanobot.agent.runner import AgentRunSpec, AgentRunner
+    from nanobot.agent.runner import AgentRunner, AgentRunSpec
 
     provider = MagicMock()
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
@@ -254,7 +292,7 @@ async def test_runner_returns_structured_tool_error():
     assert result.stop_reason == "tool_error"
     assert result.error == "Error: RuntimeError: boom"
     assert result.tool_events == [
-        {"name": "list_dir", "status": "error", "detail": "boom"}
+        {"name": "list_dir", "status": "error", "detail": "boom", "tool_call_id": "call_1"},
     ]
 
 
@@ -269,9 +307,9 @@ async def test_loop_max_iterations_message_stays_stable(tmp_path):
     loop.tools.execute = AsyncMock(return_value="ok")
     loop.max_iterations = 2
 
-    final_content, _, _ = await loop._run_agent_loop([])
+    run = await loop._run_agent_loop([])
 
-    assert final_content == (
+    assert run.final_content == (
         "I reached the maximum number of tool call iterations (2) "
         "without completing the task. You can try breaking the task into smaller steps."
     )
@@ -296,13 +334,13 @@ async def test_loop_stream_filter_handles_think_only_prefix_without_crashing(tmp
     async def on_stream_end(*, resuming: bool = False) -> None:
         endings.append(resuming)
 
-    final_content, _, _ = await loop._run_agent_loop(
+    run = await loop._run_agent_loop(
         [],
         on_stream=on_stream,
         on_stream_end=on_stream_end,
     )
 
-    assert final_content == "Hello"
+    assert run.final_content == "Hello"
     assert deltas == ["Hello"]
     assert endings == [False]
 

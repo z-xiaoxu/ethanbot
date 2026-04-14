@@ -9,6 +9,20 @@ If this file has no tasks (only headers and comments), the agent will skip the h
 
 <!-- Built-in background tasks. Results are silently processed — no user notification. -->
 
+### Skill Discovery
+
+Analyze recent conversation patterns in `memory/HISTORY.md` to identify
+repeatable workflows that could become reusable skills.
+
+1. `read_file` `memory/HISTORY.md` (last 50 entries or tail 5000 chars).
+2. `list_dir` `skills/` to see existing skills.
+3. `list_dir` `memory/skill-proposals/` to see pending proposals.
+4. Identify task patterns appearing 3+ times with similar steps.
+   Skip if the pattern is already covered by an existing skill or pending proposal.
+5. For each new pattern found, `write_file` a proposal JSON to
+   `memory/skill-proposals/prop-{date}-{short-id}.json` with the proposal schema.
+6. Maximum 2 proposals per run. Quality over quantity.
+
 ### Profile Synthesis (USER.md / SOUL.md dynamic sections)
 
 Synthesize behavioral observations from `memory/MEMORY.md` `### Pending` into the dynamic sections of `USER.md` and `SOUL.md`. Always use `read_file` / `edit_file` to stay within section scope — never use `write_file` for these files. Do not modify fixed sections in `SOUL.md` (`## Personality`, `## Values`) or anything outside `## Dynamic Profile` in `USER.md`.

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import os
+import re
+import secrets
 import time
 from contextlib import AsyncExitStack, nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -16,10 +18,10 @@ from loguru import logger
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.agent.memory import MemoryConsolidator
-from nanobot.agent.runner import AgentRunSpec, AgentRunner
+from nanobot.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
+from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
@@ -27,14 +29,128 @@ from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
-from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.bus.queue import MessageBus
-from nanobot.providers.base import LLMProvider
+from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
+from nanobot.providers.base import LLMProvider, LLMResponse
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebSearchConfig
     from nanobot.cron.service import CronService
+
+_PATCH_ANALYSIS_TOOL_NAME = "submit_skill_patch_analysis"
+
+
+def _skill_patch_analysis_tool_definition() -> dict[str, Any]:
+    """OpenAI-style tool matching ``contracts/patch-analysis-tool.v1.schema.json`` (relaxed if/then)."""
+    return {
+        "type": "function",
+        "function": {
+            "name": _PATCH_ANALYSIS_TOOL_NAME,
+            "description": (
+                "After a skill's SKILL.md was read and a tool error later recovered, "
+                "decide whether the skill instructions should be patched."
+            ),
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["should_patch"],
+                "properties": {
+                    "should_patch": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                    "diff_description": {"type": "string"},
+                    "proposed_content": {"type": "string"},
+                    "original_content": {"type": "string"},
+                },
+            },
+        },
+    }
+
+
+class _AgentLoopRunHook(AgentHook):
+    """Per-run hook: streaming, progress, reflection checkpoints."""
+
+    REFLECTION_INTERVAL = 15
+
+    def __init__(
+        self,
+        loop_self: Any,
+        *,
+        on_progress: Callable[..., Awaitable[None]] | None,
+        on_stream: Callable[[str], Awaitable[None]] | None,
+        on_stream_end: Callable[..., Awaitable[None]] | None,
+        channel: str,
+        chat_id: str,
+        message_id: str | None,
+    ) -> None:
+        self._loop = loop_self
+        self._on_progress = on_progress
+        self._on_stream = on_stream
+        self._on_stream_end = on_stream_end
+        self._channel = channel
+        self._chat_id = chat_id
+        self._message_id = message_id
+        self._stream_buf = ""
+
+    def wants_streaming(self) -> bool:
+        return self._on_stream is not None
+
+    async def before_iteration(self, context: AgentHookContext) -> None:
+        if (
+            context.iteration > 0
+            and self.REFLECTION_INTERVAL > 0
+            and context.iteration % self.REFLECTION_INTERVAL == 0
+        ):
+            context.messages.append({
+                "role": "user",
+                "content": (
+                    "[Reflection checkpoint — not from user]\n"
+                    "Pause and briefly assess:\n"
+                    "1. Am I making progress or repeating failed approaches?\n"
+                    "2. Is there a simpler strategy I haven't tried?\n"
+                    "Respond in 1-2 sentences, then continue."
+                ),
+            })
+
+    async def on_stream(self, context: AgentHookContext, delta: str) -> None:
+        from nanobot.utils.helpers import strip_think
+
+        prev_clean = strip_think(self._stream_buf)
+        self._stream_buf += delta
+        new_clean = strip_think(self._stream_buf)
+        incremental = new_clean[len(prev_clean):]
+        if incremental and self._on_stream:
+            await self._on_stream(incremental)
+
+    async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
+        if self._on_stream_end:
+            await self._on_stream_end(resuming=resuming)
+        self._stream_buf = ""
+
+    async def before_execute_tools(self, context: AgentHookContext) -> None:
+        if self._on_progress:
+            if not self._on_stream:
+                thought = self._loop._strip_think(
+                    context.response.content if context.response else None,
+                )
+                if thought:
+                    await self._on_progress(thought)
+            tool_hint = self._loop._strip_think(self._loop._tool_hint(context.tool_calls))
+            await self._on_progress(tool_hint, tool_hint=True)
+        for tc in context.tool_calls:
+            args_str = json.dumps(tc.arguments, ensure_ascii=False)
+            logger.info("Tool call: {}({})", tc.name, args_str[:200])
+        self._loop._set_tool_context(self._channel, self._chat_id, self._message_id)
+
+    async def on_retry(self, attempt: int, max_attempts: int, reason: str) -> None:
+        if self._on_progress:
+            await self._on_progress(
+                f"AI model is temporarily unavailable, retrying... "
+                f"(attempt {attempt}/{max_attempts})",
+            )
+
+    def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
+        return self._loop._strip_think(content)
 
 
 class AgentLoop:
@@ -268,6 +384,158 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _is_skill_md_read_event(ev: dict[str, str]) -> bool:
+        if ev.get("name") != "read_file" or ev.get("status") != "ok":
+            return False
+        path = (ev.get("path") or "").replace("\\", "/")
+        if path.endswith("/SKILL.md") or path.endswith("SKILL.md"):
+            return True
+        return "SKILL.md" in (ev.get("detail") or "")
+
+    @staticmethod
+    def _extract_skill_name_from_path(path: str | None) -> str | None:
+        if not path:
+            return None
+        norm = path.replace("\\", "/").strip()
+        parts = [p for p in norm.split("/") if p]
+        if len(parts) >= 2 and parts[-1] == "SKILL.md":
+            return parts[-2] or None
+        return None
+
+    @staticmethod
+    def _extract_skill_name_from_detail(detail: str) -> str | None:
+        m = re.search(r"skills[/\\]([^/\\]+)[/\\]SKILL\.md", detail)
+        return m.group(1) if m else None
+
+    @classmethod
+    def _find_skill_patch_signal(
+        cls,
+        tool_events: list[dict[str, str]],
+    ) -> tuple[str, dict[str, str]] | None:
+        """Most recent SKILL.md read followed by error then later ok (same turn)."""
+        for r in range(len(tool_events) - 1, -1, -1):
+            ev = tool_events[r]
+            if not cls._is_skill_md_read_event(ev):
+                continue
+            err_i: int | None = None
+            for i in range(r + 1, len(tool_events)):
+                if tool_events[i].get("status") == "error":
+                    err_i = i
+                    break
+            if err_i is None:
+                continue
+            recovered = False
+            for j in range(err_i + 1, len(tool_events)):
+                if tool_events[j].get("status") == "ok":
+                    recovered = True
+                    break
+            if not recovered:
+                continue
+            path = ev.get("path")
+            name = cls._extract_skill_name_from_path(path) or cls._extract_skill_name_from_detail(
+                ev.get("detail") or "",
+            )
+            if name:
+                return name, ev
+        return None
+
+    @staticmethod
+    def _parse_patch_analysis_tool_args(response: LLMResponse) -> dict[str, Any] | None:
+        if not response.tool_calls:
+            return None
+        for tc in response.tool_calls:
+            if tc.name == _PATCH_ANALYSIS_TOOL_NAME and isinstance(tc.arguments, dict):
+                return tc.arguments
+        return None
+
+    async def _analyze_skill_usage(self, result: AgentRunResult, session_key: str) -> None:
+        """Background: propose a skill patch after read + error→recovery (LLM-gated)."""
+        try:
+            if not result.tool_events:
+                return
+            found = self._find_skill_patch_signal(result.tool_events)
+            if not found:
+                return
+            skill_name, _ev = found
+            skill_path = self.workspace / "skills" / skill_name / "SKILL.md"
+            if not skill_path.is_file():
+                return
+            current = skill_path.read_text(encoding="utf-8", errors="replace")
+            events_lines = [
+                f"- {e.get('name', '')} status={e.get('status', '')} path={e.get('path', '')} "
+                f"detail={e.get('detail', '')[:160]}"
+                for e in result.tool_events
+            ]
+            user_prompt = (
+                "You are analyzing a completed agent turn for a possible skill instruction patch.\n\n"
+                f"Session: {session_key}\n\n"
+                "Tool events (chronological):\n"
+                + "\n".join(events_lines)
+                + "\n\nCurrent SKILL.md content:\n```markdown\n"
+                + current[:24_000]
+                + "\n```\n"
+                "Call the structured tool with your decision."
+            )
+            messages = [
+                {"role": "system", "content": "Respond only via the provided tool."},
+                {"role": "user", "content": user_prompt},
+            ]
+            tools = [_skill_patch_analysis_tool_definition()]
+            tool_choice: dict[str, Any] = {
+                "type": "function",
+                "function": {"name": _PATCH_ANALYSIS_TOOL_NAME},
+            }
+            llm_response = await self.provider.chat_with_retry(
+                messages=messages,
+                tools=tools,
+                model=self.model,
+                max_tokens=2048,
+                temperature=0.2,
+                tool_choice=tool_choice,
+            )
+            args = self._parse_patch_analysis_tool_args(llm_response)
+            if not args or not args.get("should_patch"):
+                return
+            proposed = args.get("proposed_content")
+            diff_desc = args.get("diff_description")
+            reason = args.get("reason")
+            if not isinstance(proposed, str) or not proposed.strip():
+                return
+            if not isinstance(diff_desc, str) or not diff_desc.strip():
+                return
+            if not isinstance(reason, str) or not reason.strip():
+                return
+
+            proposal_dir = self.workspace / "memory" / "skill-proposals"
+            proposal_dir.mkdir(parents=True, exist_ok=True)
+            date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+            short_id = secrets.token_hex(4)
+            prop_id = f"prop-{date_str}-{short_id}"
+            created = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            orig_in = args.get("original_content")
+            original_content = orig_in if isinstance(orig_in, str) else current
+            doc: dict[str, Any] = {
+                "id": prop_id,
+                "type": "patch",
+                "status": "pending",
+                "skill_name": skill_name,
+                "reason": reason.strip(),
+                "proposed_content": proposed,
+                "source_threads": [session_key],
+                "created_at": created,
+                "target_skill": skill_name,
+                "diff_description": diff_desc.strip(),
+                "original_content": original_content,
+            }
+            out_path = proposal_dir / f"{prop_id}.json"
+            out_path.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            logger.info("Wrote skill patch proposal {}", out_path.name)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Skill usage analysis failed: {}", exc)
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -278,7 +546,7 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
-    ) -> tuple[str | None, list[str], list[dict]]:
+    ) -> AgentRunResult:
         """Run the agent iteration loop.
 
         *on_stream*: called with each content delta during streaming.
@@ -286,70 +554,31 @@ class AgentLoop:
         ``resuming=True`` means tool calls follow (spinner should restart);
         ``resuming=False`` means this is the final response.
         """
-        loop_self = self
-
-        class _LoopHook(AgentHook):
-            def __init__(self) -> None:
-                self._stream_buf = ""
-
-            def wants_streaming(self) -> bool:
-                return on_stream is not None
-
-            async def on_stream(self, context: AgentHookContext, delta: str) -> None:
-                from nanobot.utils.helpers import strip_think
-
-                prev_clean = strip_think(self._stream_buf)
-                self._stream_buf += delta
-                new_clean = strip_think(self._stream_buf)
-                incremental = new_clean[len(prev_clean):]
-                if incremental and on_stream:
-                    await on_stream(incremental)
-
-            async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
-                if on_stream_end:
-                    await on_stream_end(resuming=resuming)
-                self._stream_buf = ""
-
-            async def before_execute_tools(self, context: AgentHookContext) -> None:
-                if on_progress:
-                    if not on_stream:
-                        thought = loop_self._strip_think(context.response.content if context.response else None)
-                        if thought:
-                            await on_progress(thought)
-                    tool_hint = loop_self._strip_think(loop_self._tool_hint(context.tool_calls))
-                    await on_progress(tool_hint, tool_hint=True)
-                for tc in context.tool_calls:
-                    args_str = json.dumps(tc.arguments, ensure_ascii=False)
-                    logger.info("Tool call: {}({})", tc.name, args_str[:200])
-                loop_self._set_tool_context(channel, chat_id, message_id)
-
-            async def on_retry(self, attempt: int, max_attempts: int, reason: str) -> None:
-                if on_progress:
-                    await on_progress(
-                        f"AI model is temporarily unavailable, retrying... "
-                        f"(attempt {attempt}/{max_attempts})"
-                    )
-
-            def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
-                return loop_self._strip_think(content)
-
         result = await self.runner.run(AgentRunSpec(
             initial_messages=initial_messages,
             tools=self.tools,
             model=self.model,
             max_iterations=self.max_iterations,
-            hook=_LoopHook(),
+            hook=_AgentLoopRunHook(
+                self,
+                on_progress=on_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+                channel=channel,
+                chat_id=chat_id,
+                message_id=message_id,
+            ),
             error_message="Sorry, I encountered an error calling the AI model.",
             concurrent_tools=True,
         ))
         self._last_usage = result.usage
-        final_content = result.final_content
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
         elif result.stop_reason == "error":
-            logger.error("LLM returned error: {}", (final_content or "")[:200])
-            final_content = self._classify_error(final_content)
-        return final_content, result.tools_used, result.messages
+            raw = result.final_content or ""
+            logger.error("LLM returned error: {}", raw[:200])
+            result.final_content = self._classify_error(raw)
+        return result
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -499,13 +728,16 @@ class AgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(
+            run_result = await self._run_agent_loop(
                 messages, channel=channel, chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
             )
+            final_content = run_result.final_content
+            all_msgs = run_result.messages
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
+            self._schedule_background(self._analyze_skill_usage(run_result, key))
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
 
@@ -544,7 +776,7 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
+        run_result = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
             on_stream=on_stream,
@@ -552,6 +784,8 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
         )
+        final_content = run_result.final_content
+        all_msgs = run_result.messages
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -559,6 +793,7 @@ class AgentLoop:
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
+        self._schedule_background(self._analyze_skill_usage(run_result, key))
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None

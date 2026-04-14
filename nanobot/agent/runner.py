@@ -11,6 +11,20 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, ToolCallRequest
 from nanobot.utils.helpers import build_assistant_message
 
+_FILE_TOOLS_WITH_SINGLE_PATH = frozenset({"read_file", "write_file", "edit_file"})
+
+
+def _workspace_relative_tool_path(tool_name: str, arguments: dict[str, Any]) -> str | None:
+    """Return a normalized workspace-relative path for file tools when a single path arg exists."""
+    if tool_name not in _FILE_TOOLS_WITH_SINGLE_PATH:
+        return None
+    raw = arguments.get("path")
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip().replace("\\", "/")
+    return s or None
+
+
 _DEFAULT_MAX_ITERATIONS_MESSAGE = (
     "I reached the maximum number of tool call iterations ({max_iterations}) "
     "without completing the task. You can try breaking the task into smaller steps."
@@ -217,11 +231,16 @@ class AgentRunner:
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
-            event = {
+            event: dict[str, str] = {
                 "name": tool_call.name,
                 "status": "error",
                 "detail": str(exc),
             }
+            p = _workspace_relative_tool_path(tool_call.name, tool_call.arguments)
+            if p:
+                event["path"] = p
+            if tool_call.id:
+                event["tool_call_id"] = tool_call.id
             if spec.fail_on_tool_error:
                 return f"Error: {type(exc).__name__}: {exc}", event, exc
             return f"Error: {type(exc).__name__}: {exc}", event, None
@@ -232,8 +251,14 @@ class AgentRunner:
             detail = "(empty)"
         elif len(detail) > 120:
             detail = detail[:120] + "..."
-        return result, {
+        event = {
             "name": tool_call.name,
             "status": "error" if isinstance(result, str) and result.startswith("Error") else "ok",
             "detail": detail,
-        }, None
+        }
+        p = _workspace_relative_tool_path(tool_call.name, tool_call.arguments)
+        if p:
+            event["path"] = p
+        if tool_call.id:
+            event["tool_call_id"] = tool_call.id
+        return result, event, None

@@ -341,11 +341,45 @@ def _migrate_heartbeat_sections(path: Path) -> bool:
     return True
 
 
+_SYSTEM_TASKS_RE = re.compile(
+    r"(^## System Tasks\s*\n)(.*?)(?=^## Active Tasks\s*$)",
+    re.DOTALL | re.MULTILINE,
+)
+
+
+def _sync_heartbeat_system_tasks(user_path: Path, template_text: str) -> bool:
+    """Overwrite the ``## System Tasks`` section in a user HEARTBEAT.md with the template.
+
+    Preserves ``## Active Tasks`` and everything below it.
+    Returns True if the file was modified.
+    """
+    tpl_match = _SYSTEM_TASKS_RE.search(template_text)
+    if not tpl_match:
+        return False
+
+    tpl_block = tpl_match.group(0)
+
+    user_text = user_path.read_text(encoding="utf-8")
+    user_match = _SYSTEM_TASKS_RE.search(user_text)
+    if not user_match:
+        return False
+
+    if user_match.group(0) == tpl_block:
+        return False
+
+    new_text = user_text[: user_match.start()] + tpl_block + user_text[user_match.end() :]
+    user_path.write_text(new_text, encoding="utf-8")
+    logger.info("Synced HEARTBEAT.md System Tasks with template")
+    return True
+
+
 def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
     """Sync bundled templates to workspace. Only creates missing files.
 
     Also migrates existing HEARTBEAT.md from old single-section format to
-    the ``System Tasks`` / ``Active Tasks`` layout when detected.
+    the ``System Tasks`` / ``Active Tasks`` layout when detected, then
+    overwrites ``## System Tasks`` with the current template version
+    (FR-HB-SYNC).
     """
     from importlib.resources import files as pkg_files
     try:
@@ -374,6 +408,12 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
     heartbeat_path = workspace / "HEARTBEAT.md"
     if heartbeat_path.exists():
         _migrate_heartbeat_sections(heartbeat_path)
+        tpl_heartbeat = tpl / "HEARTBEAT.md"
+        if tpl_heartbeat.is_file():
+            _sync_heartbeat_system_tasks(
+                heartbeat_path,
+                tpl_heartbeat.read_text(encoding="utf-8"),
+            )
 
     if added and not silent:
         from rich.console import Console
