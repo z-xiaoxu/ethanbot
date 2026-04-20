@@ -11,6 +11,8 @@ from typing import Any
 import tiktoken
 from loguru import logger
 
+_KNOWN_SYSTEM_HEADINGS = {"Profile Synthesis", "Topic Synthesis"}
+
 
 def strip_think(text: str) -> str:
     """Remove <think>…</think> blocks and any unclosed trailing <think> tag."""
@@ -237,15 +239,25 @@ def estimate_prompt_tokens_chain(
     return 0, "none"
 
 
+def _fmt_k_tokens(n: int) -> str:
+    n = max(0, int(n))
+    if n >= 1000:
+        return f"{n // 1000}k"
+    return str(n)
+
+
 def build_status_content(
     *,
     version: str,
     model: str,
     start_time: float,
     last_usage: dict[str, int],
+    session_usage: dict[str, int],
     context_window_tokens: int,
     session_msg_count: int,
+    consolidated_count: int,
     context_tokens_estimate: int,
+    max_completion_tokens: int,
 ) -> str:
     """Build a human-readable runtime status snapshot."""
     uptime_s = int(time.time() - start_time)
@@ -254,20 +266,28 @@ def build_status_content(
         if uptime_s >= 3600
         else f"{uptime_s // 60}m {uptime_s % 60}s"
     )
-    last_in = last_usage.get("prompt_tokens", 0)
-    last_out = last_usage.get("completion_tokens", 0)
-    ctx_total = max(context_window_tokens, 0)
-    ctx_pct = int((context_tokens_estimate / ctx_total) * 100) if ctx_total > 0 else 0
-    ctx_used_str = f"{context_tokens_estimate // 1000}k" if context_tokens_estimate >= 1000 else str(context_tokens_estimate)
-    ctx_total_str = f"{ctx_total // 1024}k" if ctx_total > 0 else "n/a"
-    return "\n".join([
+    last_in = int(last_usage.get("prompt_tokens", 0) or 0)
+    last_out = int(last_usage.get("completion_tokens", 0) or 0)
+    sess_in = int(session_usage.get("prompt_tokens", 0) or 0)
+    sess_out = int(session_usage.get("completion_tokens", 0) or 0)
+    calls = int(session_usage.get("llm_calls", 0) or 0)
+    ctx_total = max(int(context_window_tokens), 0)
+    estimate = max(0, int(context_tokens_estimate))
+    ctx_pct = int((estimate / ctx_total) * 100) if ctx_total > 0 else 0
+    reserve = max(0, int(max_completion_tokens)) + 1024
+    available = max(0, ctx_total - reserve - estimate)
+    ctx_used_str = _fmt_k_tokens(estimate)
+    ctx_total_str = _fmt_k_tokens(ctx_total) if ctx_total > 0 else "n/a"
+    lines = [
         f"\U0001f408 nanobot v{version}",
         f"\U0001f9e0 Model: {model}",
-        f"\U0001f4ca Tokens: {last_in} in / {last_out} out",
-        f"\U0001f4da Context: {ctx_used_str}/{ctx_total_str} ({ctx_pct}%)",
-        f"\U0001f4ac Session: {session_msg_count} messages",
+        f"\U0001f4ca Last call: {last_in} in / {last_out} out",
+        f"\U0001f4ca Session total: {sess_in} in / {sess_out} out ({calls} calls)",
+        f"\U0001f4da Context: {ctx_used_str}/{ctx_total_str} ({ctx_pct}%) · {available} available",
+        f"\U0001f4ac Messages: {session_msg_count} · {consolidated_count} consolidated",
         f"\u23f1 Uptime: {uptime}",
-    ])
+    ]
+    return "\n".join(lines)
 
 
 def _migrate_heartbeat_sections(path: Path) -> bool:
@@ -282,8 +302,6 @@ def _migrate_heartbeat_sections(path: Path) -> bool:
     text = path.read_text(encoding="utf-8")
     if "## System Tasks" in text or "## Active Tasks" not in text:
         return False
-
-    _KNOWN_SYSTEM_HEADINGS = {"Profile Synthesis", "Topic Synthesis"}
 
     active_match = re.search(
         r"^(## Active Tasks\s*\n)(.*?)(?=\n## |\Z)",
@@ -312,7 +330,9 @@ def _migrate_heartbeat_sections(path: Path) -> bool:
     system_parts: list[str] = []
     user_parts: list[str] = []
     for sec in sections:
-        is_system = any(kw in sec["heading"] for kw in _KNOWN_SYSTEM_HEADINGS)
+        is_system = any(
+            kw in sec["heading"] for kw in _KNOWN_SYSTEM_HEADINGS
+        )
         (system_parts if is_system else user_parts).append("".join(sec["lines"]))
 
     system_body = "".join(system_parts).strip()

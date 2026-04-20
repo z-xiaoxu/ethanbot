@@ -265,6 +265,7 @@ class _FeishuStreamBuf:
     card_id: str | None = None
     sequence: int = 0
     last_edit: float = 0.0
+    closed: bool = False
 
 
 class FeishuChannel(BaseChannel):
@@ -647,6 +648,7 @@ class FeishuChannel(BaseChannel):
         r"\*\*.+?\*\*"               # **bold**
         r"|__.+?__"                   # __bold__
         r"|(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)"  # *italic* (single *)
+        r"|(?<![A-Za-z0-9_])_(?!_)([^\n_]+?)(?<!_)_(?![A-Za-z0-9_])"  # _italic_
         r"|~~.+?~~"                   # ~~strikethrough~~
         , re.DOTALL,
     )
@@ -1100,8 +1102,9 @@ class FeishuChannel(BaseChannel):
 
         # --- stream end: final update or fallback ---
         if meta.get("_stream_end"):
-            buf = self._stream_bufs.pop(chat_id, None)
+            buf = self._stream_bufs.get(chat_id)
             if not buf or not buf.text:
+                self._stream_bufs.pop(chat_id, None)
                 return
             if buf.card_id:
                 buf.sequence += 1
@@ -1113,10 +1116,14 @@ class FeishuChannel(BaseChannel):
                 await loop.run_in_executor(
                     None, self._close_streaming_mode_sync, buf.card_id, buf.sequence,
                 )
+                # Keep buf alive so on_response_complete can append the usage suffix
+                # to the same card. It will be popped there.
+                buf.closed = True
             else:
                 for chunk in self._split_elements_by_table_limit(self._build_card_elements(buf.text)):
                     card = json.dumps({"config": {"wide_screen_mode": True}, "elements": chunk}, ensure_ascii=False)
                     await loop.run_in_executor(None, self._send_message_sync, rid_type, chat_id, "interactive", card)
+                self._stream_bufs.pop(chat_id, None)
             return
 
         # --- accumulate delta ---
@@ -1142,11 +1149,54 @@ class FeishuChannel(BaseChannel):
             buf.last_edit = now
 
     async def on_response_complete(self, msg: OutboundMessage) -> None:
-        """Update reaction when a streamed response finishes."""
+        """Finalize a streamed response: complete reaction and append usage suffix.
+
+        When ``_maybe_append_usage_suffix`` adds a token-usage trailer to
+        ``msg.content`` after the live stream has already drained, the
+        ``_stream_end`` handler only saw the LLM-original ``buf.text`` (no
+        suffix). CardKit refuses ``card_element.content`` after streaming mode
+        is closed (``code=300309 streaming mode is closed``), so updating the
+        same card in place is not possible. Send the trailer (everything
+        after ``buf.text``) as a separate small interactive card instead, so
+        the user still sees the token-usage line right under the reply.
+        """
         mid = msg.metadata.get("message_id")
         logger.debug("on_response_complete: message_id={}", mid)
         if mid:
             await self._complete_reaction(mid)
+        buf = self._stream_bufs.pop(msg.chat_id, None)
+        if not buf or not buf.card_id or not buf.closed:
+            return
+        full = msg.content or ""
+        if not full.strip() or full == buf.text:
+            return
+        # Compute the part the streaming card never saw. If the agent loop
+        # only added a trailing block (e.g. token-usage suffix), this is
+        # exactly that block; we strip the leading separator newlines.
+        if full.startswith(buf.text):
+            tail = full[len(buf.text):]
+        else:
+            # Defensive fallback: streaming dropped some chars or content was
+            # rewritten — just send the entire response as a follow-up card.
+            tail = full
+        tail = tail.lstrip("\n").rstrip()
+        if not tail:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            rid_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
+            elements = self._build_card_elements(tail)
+            for chunk in self._split_elements_by_table_limit(elements):
+                card = json.dumps(
+                    {"config": {"wide_screen_mode": True}, "elements": chunk},
+                    ensure_ascii=False,
+                )
+                await loop.run_in_executor(
+                    None, self._send_message_sync,
+                    rid_type, msg.chat_id, "interactive", card,
+                )
+        except Exception as e:
+            logger.warning("Failed to send usage-suffix tail card for {}: {}", msg.chat_id, e)
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu, including media (images/files) if present."""

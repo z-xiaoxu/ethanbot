@@ -270,6 +270,7 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
+        self._session_usage: dict[str, dict[str, int]] = {}
 
         self.context = ContextBuilder(workspace, timezone=timezone)
         self.sessions = session_manager or SessionManager(workspace)
@@ -698,6 +699,83 @@ class AgentLoop:
         self._background_tasks.append(task)
         task.add_done_callback(self._background_tasks.remove)
 
+    @staticmethod
+    def _merge_usage(dst: dict[str, int], src: dict[str, int]) -> None:
+        dst["prompt_tokens"] = dst.get("prompt_tokens", 0) + int(src.get("prompt_tokens", 0) or 0)
+        dst["completion_tokens"] = dst.get("completion_tokens", 0) + int(
+            src.get("completion_tokens", 0) or 0,
+        )
+        dst["llm_calls"] = dst.get("llm_calls", 0) + int(src.get("llm_calls", 0) or 0)
+
+    def _accumulate_session_usage(self, session_key: str, usage: dict[str, int]) -> None:
+        acc = self._session_usage.setdefault(
+            session_key, {"prompt_tokens": 0, "completion_tokens": 0, "llm_calls": 0},
+        )
+        self._merge_usage(acc, usage)
+
+    def _maybe_append_usage_suffix(self, content: str, session: Session, result: AgentRunResult) -> str:
+        if not self.provider.generation.show_usage_in_reply:
+            return content
+        u = result.usage
+        if not u:
+            return content
+        p = int(u.get("prompt_tokens", 0) or 0)
+        c = int(u.get("completion_tokens", 0) or 0)
+        try:
+            est, _ = self.memory_consolidator.estimate_session_prompt_tokens(session)
+        except Exception:
+            est = 0
+        if est <= 0:
+            est = int(self._last_usage.get("prompt_tokens", 0) or 0)
+        ctx = max(self.context_window_tokens, 0)
+        pct = int(est / ctx * 100) if ctx > 0 else 0
+        return f"{content}\n\n_{p} prompt + {c} completion tokens · ~{pct}% context used_"
+
+    async def _check_context_warning(
+        self,
+        session: Session,
+        *,
+        channel: str,
+        chat_id: str,
+        metadata: dict[str, Any] | None,
+    ) -> None:
+        ch = self.channels_config
+        if ch is not None and not ch.send_progress:
+            return
+        try:
+            estimated, _ = self.memory_consolidator.estimate_session_prompt_tokens(session)
+        except Exception:
+            return
+        if estimated <= 0 or self.context_window_tokens <= 0:
+            return
+        ctx_total = max(self.context_window_tokens, 0)
+        fill_pct = estimated / ctx_total * 100
+        if fill_pct < 80:
+            return
+        warn_key = f"_ctx_warned_{session.last_consolidated}"
+        prev = session.metadata.get(warn_key)
+        if fill_pct >= 90:
+            if prev == 2:
+                return
+            text = (
+                "Context window is nearly full (~90%+). Consider starting a fresh session with /new "
+                "to avoid truncation or errors."
+            )
+            session.metadata[warn_key] = 2
+        else:
+            if prev in (1, 2):
+                return
+            text = (
+                "Context usage is high (~80%+). Older messages are being consolidated into memory automatically."
+            )
+            session.metadata[warn_key] = 1
+        self.sessions.save(session)
+        meta = dict(metadata or {})
+        meta["_progress"] = True
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=channel, chat_id=chat_id, content=text, metadata=meta,
+        ))
+
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
@@ -736,10 +814,15 @@ class AgentLoop:
             all_msgs = run_result.messages
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
+            self._accumulate_session_usage(key, run_result.usage)
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
             self._schedule_background(self._analyze_skill_usage(run_result, key))
-            return OutboundMessage(channel=channel, chat_id=chat_id,
-                                  content=final_content or "Background task completed.")
+            self._schedule_background(self._check_context_warning(
+                session, channel=channel, chat_id=chat_id, metadata=msg.metadata,
+            ))
+            out = final_content or "Background task completed."
+            out = self._maybe_append_usage_suffix(out, session, run_result)
+            return OutboundMessage(channel=channel, chat_id=chat_id, content=out)
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
@@ -792,12 +875,17 @@ class AgentLoop:
 
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
+        self._accumulate_session_usage(key, run_result.usage)
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
         self._schedule_background(self._analyze_skill_usage(run_result, key))
+        self._schedule_background(self._check_context_warning(
+            session, channel=msg.channel, chat_id=msg.chat_id, metadata=msg.metadata,
+        ))
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
 
+        final_content = self._maybe_append_usage_suffix(final_content, session, run_result)
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 

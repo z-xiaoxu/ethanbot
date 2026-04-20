@@ -74,7 +74,9 @@ class AgentRunner:
         messages = list(spec.initial_messages)
         final_content: str | None = None
         tools_used: list[str] = []
-        usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        run_prompt = 0
+        run_completion = 0
+        run_llm_calls = 0
         error: str | None = None
         stop_reason = "completed"
         tool_events: list[dict[str, str]] = []
@@ -113,12 +115,16 @@ class AgentRunner:
                 )
 
             raw_usage = response.usage or {}
-            usage = {
-                "prompt_tokens": int(raw_usage.get("prompt_tokens", 0) or 0),
-                "completion_tokens": int(raw_usage.get("completion_tokens", 0) or 0),
-            }
+            round_prompt = int(raw_usage.get("prompt_tokens", 0) or 0)
+            round_completion = int(raw_usage.get("completion_tokens", 0) or 0)
+            run_prompt += round_prompt
+            run_completion += round_completion
+            run_llm_calls += 1
             context.response = response
-            context.usage = usage
+            context.usage = {
+                "prompt_tokens": round_prompt,
+                "completion_tokens": round_completion,
+            }
             context.tool_calls = list(response.tool_calls)
 
             if response.has_tool_calls:
@@ -189,7 +195,11 @@ class AgentRunner:
             final_content=final_content,
             messages=messages,
             tools_used=tools_used,
-            usage=usage,
+            usage={
+                "prompt_tokens": run_prompt,
+                "completion_tokens": run_completion,
+                "llm_calls": run_llm_calls,
+            },
             stop_reason=stop_reason,
             error=error,
             tool_events=tool_events,

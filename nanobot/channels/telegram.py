@@ -164,6 +164,7 @@ class _StreamBuf:
     message_id: int | None = None
     last_edit: float = 0.0
     stream_id: str | None = None
+    closed: bool = False
 
 
 class TelegramConfig(Base):
@@ -494,6 +495,9 @@ class TelegramChannel(BaseChannel):
         if meta.get("_stream_end"):
             buf = self._stream_bufs.get(chat_id)
             if not buf or not buf.message_id or not buf.text:
+                # Nothing useful to keep around — drop any stray buf so the next
+                # message starts clean.
+                self._stream_bufs.pop(chat_id, None)
                 return
             if stream_id is not None and buf.stream_id is not None and buf.stream_id != stream_id:
                 return
@@ -508,7 +512,7 @@ class TelegramChannel(BaseChannel):
             except Exception as e:
                 if self._is_not_modified_error(e):
                     logger.debug("Final stream edit already applied for {}", chat_id)
-                    self._stream_bufs.pop(chat_id, None)
+                    buf.closed = True
                     return
                 logger.debug("Final stream edit failed (HTML), trying plain: {}", e)
                 try:
@@ -520,11 +524,13 @@ class TelegramChannel(BaseChannel):
                 except Exception as e2:
                     if self._is_not_modified_error(e2):
                         logger.debug("Final stream plain edit already applied for {}", chat_id)
-                        self._stream_bufs.pop(chat_id, None)
+                        buf.closed = True
                         return
                     logger.warning("Final stream edit failed: {}", e2)
-                    raise  # Let ChannelManager handle retry
-            self._stream_bufs.pop(chat_id, None)
+                    raise  # Let ChannelManager handle retry; keep buf for retry
+            # Keep buf alive so on_response_complete can append the usage suffix
+            # on the same message; it will pop the buf when done.
+            buf.closed = True
             return
 
         buf = self._stream_bufs.get(chat_id)
@@ -564,6 +570,49 @@ class TelegramChannel(BaseChannel):
                     return
                 logger.warning("Stream edit failed: {}", e)
                 raise  # Let ChannelManager handle retry
+
+    async def on_response_complete(self, msg: OutboundMessage) -> None:
+        """Append a token-usage suffix to the same streamed message.
+
+        ``send_delta(_stream_end)`` only saw the LLM-original ``buf.text`` (no
+        suffix). The agent loop appends ``_maybe_append_usage_suffix`` to
+        ``msg.content`` afterwards; without this final edit the user would
+        miss the trailer entirely.
+        """
+        if not self._app:
+            self._stream_bufs.pop(msg.chat_id, None)
+            return
+        buf = self._stream_bufs.pop(msg.chat_id, None)
+        if not buf or not buf.message_id or not buf.closed:
+            return
+        full = msg.content or ""
+        if not full.strip() or full == buf.text:
+            return
+        try:
+            int_chat_id = int(msg.chat_id)
+        except (TypeError, ValueError):
+            return
+        try:
+            html = _markdown_to_telegram_html(full)
+            await self._call_with_retry(
+                self._app.bot.edit_message_text,
+                chat_id=int_chat_id, message_id=buf.message_id,
+                text=html, parse_mode="HTML",
+            )
+        except Exception as e:
+            if self._is_not_modified_error(e):
+                return
+            logger.debug("Final usage-suffix edit failed (HTML), trying plain: {}", e)
+            try:
+                await self._call_with_retry(
+                    self._app.bot.edit_message_text,
+                    chat_id=int_chat_id, message_id=buf.message_id,
+                    text=full,
+                )
+            except Exception as e2:
+                if self._is_not_modified_error(e2):
+                    return
+                logger.warning("Final usage-suffix edit failed for {}: {}", msg.chat_id, e2)
 
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""

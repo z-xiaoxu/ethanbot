@@ -356,7 +356,10 @@ async def test_send_delta_stream_end_treats_not_modified_as_success() -> None:
 
     await channel.send_delta("123", "", {"_stream_end": True, "_stream_id": "s:0"})
 
-    assert "123" not in channel._stream_bufs
+    # Buf is preserved (marked closed) so on_response_complete can append the
+    # token-usage suffix to the same message; it is popped there.
+    assert "123" in channel._stream_bufs
+    assert channel._stream_bufs["123"].closed is True
 
 
 @pytest.mark.asyncio
@@ -947,6 +950,121 @@ async def test_forward_command_does_not_inject_reply_context() -> None:
 
     assert len(handled) == 1
     assert handled[0]["content"] == "/new"
+
+
+@pytest.mark.asyncio
+async def test_on_response_complete_appends_usage_suffix() -> None:
+    """When OutboundMessage.content has a tail (usage suffix), edit the same message."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.edit_message_text = AsyncMock()
+    channel._stream_bufs["123"] = _StreamBuf(
+        text="Hello world",
+        message_id=7,
+        last_edit=0.0,
+        stream_id="s:0",
+        closed=True,
+    )
+
+    msg = OutboundMessage(
+        channel="telegram",
+        chat_id="123",
+        content="Hello world\n\n_3 prompt + 1 completion tokens · ~0% context used_",
+    )
+    await channel.on_response_complete(msg)
+
+    channel._app.bot.edit_message_text.assert_awaited_once()
+    edit_kwargs = channel._app.bot.edit_message_text.await_args.kwargs
+    assert edit_kwargs["chat_id"] == 123
+    assert edit_kwargs["message_id"] == 7
+    # HTML conversion turns `_..._` italic into <i>...</i>
+    assert "<i>" in edit_kwargs["text"]
+    assert "3 prompt" in edit_kwargs["text"]
+    assert "123" not in channel._stream_bufs
+
+
+@pytest.mark.asyncio
+async def test_on_response_complete_no_buf_is_noop() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.edit_message_text = AsyncMock()
+    msg = OutboundMessage(channel="telegram", chat_id="123", content="anything")
+    await channel.on_response_complete(msg)
+    channel._app.bot.edit_message_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_on_response_complete_buf_not_closed_skips() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.edit_message_text = AsyncMock()
+    channel._stream_bufs["123"] = _StreamBuf(
+        text="hello", message_id=7, last_edit=0.0, closed=False,
+    )
+    msg = OutboundMessage(channel="telegram", chat_id="123", content="hello tail")
+    await channel.on_response_complete(msg)
+    channel._app.bot.edit_message_text.assert_not_awaited()
+    # Buf is popped — fresh buf will be created for next message
+    assert "123" not in channel._stream_bufs
+
+
+@pytest.mark.asyncio
+async def test_on_response_complete_same_content_skips_edit() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.edit_message_text = AsyncMock()
+    channel._stream_bufs["123"] = _StreamBuf(
+        text="Hello world", message_id=7, last_edit=0.0, closed=True,
+    )
+    msg = OutboundMessage(channel="telegram", chat_id="123", content="Hello world")
+    await channel.on_response_complete(msg)
+    channel._app.bot.edit_message_text.assert_not_awaited()
+    assert "123" not in channel._stream_bufs
+
+
+@pytest.mark.asyncio
+async def test_on_response_complete_falls_back_to_plain_on_html_failure() -> None:
+    from telegram.error import BadRequest
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    calls: list[dict] = []
+
+    async def edit(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("parse_mode") == "HTML":
+            raise BadRequest("can't parse entities")
+        return None
+
+    channel._app.bot.edit_message_text = edit
+    channel._stream_bufs["123"] = _StreamBuf(
+        text="Hello", message_id=7, last_edit=0.0, closed=True,
+    )
+
+    msg = OutboundMessage(
+        channel="telegram", chat_id="123", content="Hello\n\n_tokens used_",
+    )
+    await channel.on_response_complete(msg)
+
+    assert len(calls) == 2
+    assert calls[0]["parse_mode"] == "HTML"
+    assert "parse_mode" not in calls[1]
+    assert calls[1]["text"] == msg.content
 
 
 @pytest.mark.asyncio

@@ -73,6 +73,7 @@ class StreamRenderer:
         self._live: Live | None = None
         self._t = 0.0
         self.streamed = False
+        self.rendered_text = ""
         self._spinner: ThinkingSpinner | None = None
         self._start_spinner()
 
@@ -92,6 +93,7 @@ class StreamRenderer:
     async def on_delta(self, delta: str) -> None:
         self.streamed = True
         self._buf += delta
+        self.rendered_text += delta
         if self._live is None:
             if not self._buf.strip():
                 return

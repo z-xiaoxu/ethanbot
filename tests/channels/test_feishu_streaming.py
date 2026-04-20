@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.feishu import FeishuChannel, FeishuConfig, _FeishuStreamBuf
 
@@ -182,7 +183,10 @@ class TestSendDelta:
 
         await ch.send_delta("oc_chat1", "", metadata={"_stream_end": True})
 
-        assert "oc_chat1" not in ch._stream_bufs
+        # Buf is preserved (closed) so on_response_complete can append the
+        # token-usage suffix to the same card; it is popped there.
+        assert "oc_chat1" in ch._stream_bufs
+        assert ch._stream_bufs["oc_chat1"].closed is True
         ch._client.cardkit.v1.card_element.content.assert_called_once()
         ch._client.cardkit.v1.card.settings.assert_called_once()
         settings_call = ch._client.cardkit.v1.card.settings.call_args[0][0]
@@ -237,6 +241,105 @@ class TestSendDelta:
         buf.last_edit = 0.0  # reset to bypass throttle
         await ch.send_delta("oc_chat1", "c")
         assert buf.sequence == 7
+
+
+class TestOnResponseComplete:
+    @pytest.mark.asyncio
+    async def test_sends_suffix_tail_as_separate_card(self):
+        """CardKit refuses stream-update after close (code=300309), so the
+        trailer (e.g. token-usage suffix) must be sent as a separate card."""
+        ch = _make_channel()
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+            text="Hello world",
+            card_id="card_abc",
+            sequence=4,
+            last_edit=0.0,
+            closed=True,
+        )
+        ch._client.im.v1.message.create.return_value = _mock_send_response("om_tail")
+
+        msg = OutboundMessage(
+            channel="feishu",
+            chat_id="oc_chat1",
+            content="Hello world\n\n_3 prompt + 1 completion tokens · ~0% context used_",
+        )
+        await ch.on_response_complete(msg)
+
+        # No stream-update on the closed card (would return code=300309).
+        ch._client.cardkit.v1.card_element.content.assert_not_called()
+        # A separate interactive card is sent containing only the trailer.
+        ch._client.im.v1.message.create.assert_called_once()
+        send_call = ch._client.im.v1.message.create.call_args[0][0]
+        sent_content = send_call.body.content
+        # tail content should include the suffix text but not the LLM-original body
+        assert "3 prompt" in sent_content
+        assert "Hello world" not in sent_content
+        # message type is interactive (so italic markdown renders)
+        assert send_call.body.msg_type == "interactive"
+        assert "oc_chat1" not in ch._stream_bufs
+
+    @pytest.mark.asyncio
+    async def test_no_buf_is_noop(self):
+        ch = _make_channel()
+        msg = OutboundMessage(channel="feishu", chat_id="oc_chat1", content="anything")
+        await ch.on_response_complete(msg)
+        ch._client.im.v1.message.create.assert_not_called()
+        ch._client.cardkit.v1.card_element.content.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_buf_not_closed_skips(self):
+        """Defensive: if _stream_end never ran, don't try to send a tail."""
+        ch = _make_channel()
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+            text="hello", card_id="card_1", sequence=1, last_edit=0.0, closed=False,
+        )
+        msg = OutboundMessage(channel="feishu", chat_id="oc_chat1", content="hello with tail")
+        await ch.on_response_complete(msg)
+        ch._client.im.v1.message.create.assert_not_called()
+        ch._client.cardkit.v1.card_element.content.assert_not_called()
+        # buf is still popped — fresh buf will be created for next message
+        assert "oc_chat1" not in ch._stream_bufs
+
+    @pytest.mark.asyncio
+    async def test_same_content_is_noop(self):
+        ch = _make_channel()
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+            text="Hello world", card_id="card_1", sequence=4, last_edit=0.0, closed=True,
+        )
+        msg = OutboundMessage(channel="feishu", chat_id="oc_chat1", content="Hello world")
+        await ch.on_response_complete(msg)
+        ch._client.im.v1.message.create.assert_not_called()
+        assert "oc_chat1" not in ch._stream_bufs
+
+    @pytest.mark.asyncio
+    async def test_no_card_id_is_noop(self):
+        ch = _make_channel()
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+            text="Hello", card_id=None, sequence=0, last_edit=0.0, closed=True,
+        )
+        msg = OutboundMessage(channel="feishu", chat_id="oc_chat1", content="Hello tail")
+        await ch.on_response_complete(msg)
+        ch._client.im.v1.message.create.assert_not_called()
+
+
+class TestDetectMsgFormatItalic:
+    """_detect_msg_format must upgrade fmt for `_italic_` so Feishu renders it."""
+
+    def test_underscore_italic_short_text_uses_card(self):
+        ch = _make_channel()
+        fmt = ch._detect_msg_format("Hello _world_ short")
+        # Single-underscore italic should not fall back to plain text where the
+        # underscores would render literally.
+        assert fmt != "text"
+
+    def test_plain_short_text_stays_text(self):
+        ch = _make_channel()
+        assert ch._detect_msg_format("just a short reply") == "text"
+
+    def test_underscore_inside_word_does_not_trigger(self):
+        ch = _make_channel()
+        # snake_case style identifiers should NOT count as italic.
+        assert ch._detect_msg_format("see some_var_name here") == "text"
 
 
 class TestSendMessageReturnsId:

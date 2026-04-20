@@ -1,12 +1,11 @@
 """CLI commands for nanobot."""
 
 import asyncio
-from contextlib import contextmanager, nullcontext
-
 import os
 import select
 import signal
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -449,6 +448,7 @@ def _make_provider(config: Config):
         temperature=defaults.temperature,
         max_tokens=defaults.max_tokens,
         reasoning_effort=defaults.reasoning_effort,
+        show_usage_in_reply=defaults.show_usage_in_reply,
     )
     return provider
 
@@ -476,6 +476,7 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
 def _warn_deprecated_config_keys(config_path: Path | None) -> None:
     """Hint users to remove obsolete keys from their config file."""
     import json
+
     from nanobot.config.loader import get_config_path
 
     path = config_path or get_config_path()
@@ -809,6 +810,13 @@ def agent(
                     render_markdown=markdown,
                     metadata=response.metadata if response else None,
                 )
+            else:
+                full = response.content if response else ""
+                tail = full[len(renderer.rendered_text):]
+                if tail.strip():
+                    _make_console().print(
+                        _response_renderable(tail.lstrip("\n"), markdown),
+                    )
             await agent_loop.close_mcp()
 
         asyncio.run(run_once())
@@ -862,6 +870,14 @@ def agent(
                                 )
                             continue
                         if msg.metadata.get("_streamed"):
+                            if renderer and msg.content:
+                                tail = msg.content[len(renderer.rendered_text):]
+                                if tail.strip():
+                                    await _print_interactive_response(
+                                        tail.lstrip("\n"),
+                                        render_markdown=markdown,
+                                        metadata=msg.metadata,
+                                    )
                             turn_done.set()
                             continue
 

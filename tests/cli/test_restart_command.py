@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.events import InboundMessage
 from nanobot.providers.base import LLMResponse
 
 
@@ -124,9 +124,11 @@ class TestRestartCommand:
         loop, _bus = _make_loop()
         session = MagicMock()
         session.get_history.return_value = [{"role": "user"}] * 3
+        session.last_consolidated = 0
         loop.sessions.get_or_create.return_value = session
         loop._start_time = time.time() - 125
         loop._last_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        loop.provider.generation.max_tokens = 4096
         loop.memory_consolidator.estimate_session_prompt_tokens = MagicMock(
             return_value=(20500, "tiktoken")
         )
@@ -137,9 +139,9 @@ class TestRestartCommand:
 
         assert response is not None
         assert "Model: test-model" in response.content
-        assert "Tokens: 0 in / 0 out" in response.content
-        assert "Context: 20k/64k (31%)" in response.content
-        assert "Session: 3 messages" in response.content
+        assert "Last call: 0 in / 0 out" in response.content
+        assert "Context: 20k/65k (31%)" in response.content
+        assert "Messages: 3 ·" in response.content
         assert "Uptime: 2m 5s" in response.content
         assert response.metadata == {"render_as": "text"}
 
@@ -152,18 +154,20 @@ class TestRestartCommand:
         ])
 
         await loop._run_agent_loop([])
-        assert loop._last_usage == {"prompt_tokens": 9, "completion_tokens": 4}
+        assert loop._last_usage == {"prompt_tokens": 9, "completion_tokens": 4, "llm_calls": 1}
 
         await loop._run_agent_loop([])
-        assert loop._last_usage == {"prompt_tokens": 0, "completion_tokens": 0}
+        assert loop._last_usage == {"prompt_tokens": 0, "completion_tokens": 0, "llm_calls": 1}
 
     @pytest.mark.asyncio
     async def test_status_falls_back_to_last_usage_when_context_estimate_missing(self):
         loop, _bus = _make_loop()
         session = MagicMock()
         session.get_history.return_value = [{"role": "user"}]
+        session.last_consolidated = 0
         loop.sessions.get_or_create.return_value = session
         loop._last_usage = {"prompt_tokens": 1200, "completion_tokens": 34}
+        loop.provider.generation.max_tokens = 4096
         loop.memory_consolidator.estimate_session_prompt_tokens = MagicMock(
             return_value=(0, "none")
         )
@@ -173,8 +177,8 @@ class TestRestartCommand:
         )
 
         assert response is not None
-        assert "Tokens: 1200 in / 34 out" in response.content
-        assert "Context: 1k/64k (1%)" in response.content
+        assert "Last call: 1200 in / 34 out" in response.content
+        assert "Context: 1k/65k (1%)" in response.content
 
     @pytest.mark.asyncio
     async def test_process_direct_preserves_render_metadata(self):

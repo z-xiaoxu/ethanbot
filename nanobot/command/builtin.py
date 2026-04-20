@@ -52,15 +52,19 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
         pass
     if ctx_est <= 0:
         ctx_est = loop._last_usage.get("prompt_tokens", 0)
+    max_tok = loop.provider.generation.max_tokens
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
         content=build_status_content(
             version=__version__, model=loop.model,
             start_time=loop._start_time, last_usage=loop._last_usage,
+            session_usage=loop._session_usage.get(ctx.key, {}),
             context_window_tokens=loop.context_window_tokens,
             session_msg_count=len(session.get_history(max_messages=0)),
+            consolidated_count=session.last_consolidated,
             context_tokens_estimate=ctx_est,
+            max_completion_tokens=max_tok,
         ),
         metadata={"render_as": "text"},
     )
@@ -70,6 +74,10 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     """Start a fresh session."""
     loop = ctx.loop
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
+    loop._session_usage.pop(session.key, None)
+    for mk in list(session.metadata.keys()):
+        if mk.startswith("_ctx_warned_"):
+            del session.metadata[mk]
     snapshot = session.messages[session.last_consolidated:]
     session.clear()
     loop.sessions.save(session)
